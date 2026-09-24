@@ -1,0 +1,19 @@
+name: CI
+
+on:
+  push:
+    branches: [ main, dev ]
+  pull_request:
+    branches: [ main, dev ]
+
+jobs:
+  build:
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Compile cmux-ffm
+        run: swiftc -O -o cmux-ffm Sources/main.swift
+      - name: Verify CLI
+        run: ./cmux-ffm --help
+      - name: Verify Version
+        run: ./cmux-ffm --version

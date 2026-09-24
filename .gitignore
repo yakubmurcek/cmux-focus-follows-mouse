@@ -1,0 +1,6 @@
+.DS_Store
+.build/
+cmux-ffm
+*.log
+.swiftpm/
+Package.resolved
