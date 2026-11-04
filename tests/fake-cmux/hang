@@ -1,0 +1,3 @@
+#!/usr/bin/env bash
+# Never answers.
+exec sleep 30
