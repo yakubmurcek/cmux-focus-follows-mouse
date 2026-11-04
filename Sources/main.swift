@@ -12,12 +12,15 @@
 
 import Cocoa
 
-let version = "1.0.0"
+let version = "1.1.0"
 
 // MARK: - Configuration & CLI Arguments
 
 struct Config {
     var cmuxBin: String = {
+        if let override = ProcessInfo.processInfo.environment["CMUX_BIN"], !override.isEmpty {
+            return override
+        }
         let appBundleBin = "/Applications/cmux.app/Contents/Resources/bin/cmux"
         if FileManager.default.isExecutableFile(atPath: appBundleBin) {
             return appBundleBin
@@ -39,6 +42,7 @@ struct Config {
     var dwellSeconds: TimeInterval = 0.05       // Pointer must rest in new pane this long
     var activeWindow: TimeInterval = 1.0        // Active evaluation window after last mouse move
     var layoutMaxAge: TimeInterval = 0.5        // Max age of cached pane layout before refreshing
+    var commandTimeout: TimeInterval = 3.0      // A cmux call slower than this is killed (real calls take 0.1-0.5 s, up to ~3 s right after cmux launches)
     var debug: Bool = false
 }
 
@@ -67,22 +71,21 @@ struct Layout {
 
 // MARK: - Subprocess Execution
 
-@discardableResult
-func runCmux(_ args: [String], quiet: Bool = true) -> (output: String?, exitCode: Int32) {
+/// Runs a command and returns its stdout. stderr is discarded (an unread stderr pipe
+/// fills at ~64 KB and blocks the child forever), and a child that runs longer than
+/// `timeout` is killed, so a stuck cmux call can never freeze the daemon's main loop.
+func runProcess(_ executable: String, _ args: [String],
+                environment: [String: String]? = nil,
+                timeout: TimeInterval) -> (output: String?, exitCode: Int32) {
     let p = Process()
-    p.executableURL = URL(fileURLWithPath: config.cmuxBin)
+    p.executableURL = URL(fileURLWithPath: executable)
     p.arguments = args
-
-    var env = ProcessInfo.processInfo.environment
-    if quiet {
-        env["CMUX_QUIET"] = "1"
+    if let environment = environment {
+        p.environment = environment
     }
-    p.environment = env
-
     let out = Pipe()
-    let err = Pipe()
     p.standardOutput = out
-    p.standardError = err
+    p.standardError = FileHandle.nullDevice
 
     do {
         try p.run()
@@ -90,11 +93,50 @@ func runCmux(_ args: [String], quiet: Bool = true) -> (output: String?, exitCode
         return (nil, -1)
     }
 
-    let data = out.fileHandleForReading.readDataToEndOfFile()
+    // Drain stdout off the main thread so the timeout below can fire.
+    var data = Data()
+    let lock = NSLock()
+    let readDone = DispatchSemaphore(value: 0)
+    DispatchQueue.global(qos: .userInitiated).async {
+        let d = out.fileHandleForReading.readDataToEndOfFile()
+        lock.lock(); data = d; lock.unlock()
+        readDone.signal()
+    }
+
+    if readDone.wait(timeout: .now() + timeout) == .timedOut {
+        if p.isRunning {
+            kill(p.processIdentifier, SIGKILL)
+        }
+        p.waitUntilExit()
+        if config.debug {
+            print("[debug] Killed `\((executable as NSString).lastPathComponent) \(args.joined(separator: " "))` after \(timeout)s timeout")
+        }
+        return (nil, -2)
+    }
     p.waitUntilExit()
-    let text = String(data: data, encoding: .utf8)
-    return (text, p.terminationStatus)
+    lock.lock(); let result = data; lock.unlock()
+    return (String(data: result, encoding: .utf8), p.terminationStatus)
 }
+
+@discardableResult
+func runCmux(_ args: [String], quiet: Bool = true) -> (output: String?, exitCode: Int32) {
+    // After a timed-out call, give cmux a few seconds before trying again, so a hung
+    // cmux costs one 3 s stall rather than freezing the daemon continuously.
+    if Date() < cmuxBackoffUntil {
+        return (nil, -3)
+    }
+    var env = ProcessInfo.processInfo.environment
+    if quiet {
+        env["CMUX_QUIET"] = "1"
+    }
+    let result = runProcess(config.cmuxBin, args, environment: env, timeout: config.commandTimeout)
+    if result.exitCode == -2 {
+        cmuxBackoffUntil = Date().addingTimeInterval(5)
+    }
+    return result
+}
+
+var cmuxBackoffUntil = Date.distantPast
 
 // MARK: - Layout Discovery
 
@@ -172,10 +214,7 @@ func globalPointerLocation() -> CGPoint {
 }
 
 func isCmuxFrontmost() -> Bool {
-    guard let front = NSWorkspace.shared.frontmostApplication else { return false }
-    let name = (front.localizedName ?? "").lowercased()
-    let bundle = (front.bundleIdentifier ?? "").lowercased()
-    return name.contains("cmux") || bundle.contains("cmux")
+    isCmux(NSWorkspace.shared.frontmostApplication)
 }
 
 // MARK: - Main Loop State
@@ -285,14 +324,16 @@ func runDoctor() {
 
     // 2. Running application check
     let apps = NSRunningApplication.runningApplications(withBundleIdentifier: "com.cmuxterm.app")
+    let cmuxRunning = !apps.isEmpty
     if let app = apps.first {
         print("[✓] cmux is running (PID: \(app.processIdentifier))")
     } else {
         print("[!] cmux is not currently running.")
+        print("    Start cmux, then run --doctor again to test the socket connection.")
     }
 
-    // 3. Socket control check
-    if binExists {
+    // 3. Socket control check (only meaningful while cmux is running)
+    if binExists && cmuxRunning {
         let (output, exitCode) = runCmux(["workspace", "list", "--json"], quiet: false)
         if exitCode == 0, output != nil {
             print("[✓] Socket communication succeeded (socket control mode is properly set)")
@@ -333,20 +374,7 @@ func runDoctor() {
 }
 
 func runCommand(_ args: [String]) -> (String?, Int32) {
-    let p = Process()
-    p.executableURL = URL(fileURLWithPath: "/usr/bin/env")
-    p.arguments = args
-    let out = Pipe()
-    p.standardOutput = out
-    p.standardError = Pipe()
-    do {
-        try p.run()
-        let data = out.fileHandleForReading.readDataToEndOfFile()
-        p.waitUntilExit()
-        return (String(data: data, encoding: .utf8), p.terminationStatus)
-    } catch {
-        return (nil, -1)
-    }
+    runProcess("/usr/bin/env", args, timeout: 5.0)
 }
 
 // MARK: - CLI Entrypoint
@@ -366,6 +394,7 @@ if args.contains("--help") || args.contains("-h") {
       -v, --version         Show version
       --doctor              Diagnose cmux connection, socket permissions, and LaunchAgent
       --debug               Run in foreground with verbose event logging
+      --layout              Print the pane rectangles cmux reports, then exit
       --dwell <seconds>     Time pointer must rest in pane before focusing (default: 0.05)
       --poll <seconds>      Polling interval in seconds (default: 0.05)
 
@@ -385,8 +414,21 @@ if args.contains("--doctor") {
     exit(0)
 }
 
+if args.contains("--layout") {
+    guard let lay = fetchLayout() else {
+        print("Could not read the pane layout from cmux. Run `cmux-ffm --doctor` to see why.")
+        exit(1)
+    }
+    print("workspace \(lay.workspaceRef) in window \(lay.windowRef), container \(Int(lay.containerW))x\(Int(lay.containerH))")
+    for p in lay.panes {
+        print("  \(p.ref)  x=\(Int(p.x)) y=\(Int(p.y)) w=\(Int(p.w)) h=\(Int(p.h))\(p.focused ? "  (focused)" : "")")
+    }
+    exit(0)
+}
+
 if args.contains("--debug") {
     config.debug = true
+    setvbuf(stdout, nil, _IOLBF, 0) // line-buffer so `--debug > file` shows events live
     print("cmux-ffm v\(version) running in debug mode...")
 }
 
@@ -400,7 +442,37 @@ if let pollIdx = args.firstIndex(of: "--poll"), pollIdx + 1 < args.count,
     config.pollInterval = p
 }
 
+// Poll only while cmux is the active app. Outside cmux the daemon sleeps on
+// activation notifications instead of waking 20 times a second.
+var pollTimer: Timer?
+
+func isCmux(_ app: NSRunningApplication?) -> Bool {
+    guard let app = app else { return false }
+    let name = (app.localizedName ?? "").lowercased()
+    let bundle = (app.bundleIdentifier ?? "").lowercased()
+    return name.contains("cmux") || bundle.contains("cmux")
+}
+
+func setPolling(_ on: Bool) {
+    if on, pollTimer == nil {
+        pollTimer = Timer.scheduledTimer(withTimeInterval: config.pollInterval, repeats: true) { _ in tick() }
+        if config.debug { print("[debug] cmux active: polling") }
+    } else if !on, let t = pollTimer {
+        t.invalidate()
+        pollTimer = nil
+        candidateRef = nil
+        layout = nil
+        if config.debug { print("[debug] cmux inactive: idle") }
+    }
+}
+
 let app = NSApplication.shared
 app.setActivationPolicy(.accessory)
-Timer.scheduledTimer(withTimeInterval: config.pollInterval, repeats: true) { _ in tick() }
+NSWorkspace.shared.notificationCenter.addObserver(
+    forName: NSWorkspace.didActivateApplicationNotification, object: nil, queue: .main
+) { note in
+    let activated = note.userInfo?[NSWorkspace.applicationUserInfoKey] as? NSRunningApplication
+    setPolling(isCmux(activated))
+}
+setPolling(isCmuxFrontmost())
 RunLoop.main.run()

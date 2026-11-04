@@ -1,0 +1,9 @@
+#!/usr/bin/env bash
+# Fake cmux CLI: answers the two queries cmux-ffm makes with a two-pane layout.
+case "$1" in
+  workspace) echo '{"window_ref":"window:1","workspaces":[{"ref":"workspace:1","selected":true}]}' ;;
+  list-panes) echo '{"container_frame":{"width":1400,"height":800},"panes":[
+    {"ref":"pane:1","focused":true,"pixel_frame":{"x":200,"y":30,"width":600,"height":800}},
+    {"ref":"pane:2","focused":false,"pixel_frame":{"x":800,"y":30,"width":600,"height":800}}]}' ;;
+  *) exit 0 ;;
+esac
