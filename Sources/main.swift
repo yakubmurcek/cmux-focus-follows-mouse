@@ -104,7 +104,9 @@ func runProcess(_ executable: String, _ args: [String],
     }
 
     if readDone.wait(timeout: .now() + timeout) == .timedOut {
-        kill(p.processIdentifier, SIGKILL)
+        if p.isRunning {
+            kill(p.processIdentifier, SIGKILL)
+        }
         p.waitUntilExit()
         if config.debug {
             print("[debug] Killed `\((executable as NSString).lastPathComponent) \(args.joined(separator: " "))` after \(timeout)s timeout")
@@ -118,12 +120,23 @@ func runProcess(_ executable: String, _ args: [String],
 
 @discardableResult
 func runCmux(_ args: [String], quiet: Bool = true) -> (output: String?, exitCode: Int32) {
+    // After a timed-out call, give cmux a few seconds before trying again, so a hung
+    // cmux costs one 3 s stall rather than freezing the daemon continuously.
+    if Date() < cmuxBackoffUntil {
+        return (nil, -3)
+    }
     var env = ProcessInfo.processInfo.environment
     if quiet {
         env["CMUX_QUIET"] = "1"
     }
-    return runProcess(config.cmuxBin, args, environment: env, timeout: config.commandTimeout)
+    let result = runProcess(config.cmuxBin, args, environment: env, timeout: config.commandTimeout)
+    if result.exitCode == -2 {
+        cmuxBackoffUntil = Date().addingTimeInterval(5)
+    }
+    return result
 }
+
+var cmuxBackoffUntil = Date.distantPast
 
 // MARK: - Layout Discovery
 
