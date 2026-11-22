@@ -9,7 +9,7 @@ PLIST_FILE ?= $(PLIST_DIR)/$(PLIST_LABEL).plist
 SWIFTC ?= swiftc
 SWIFTFLAGS ?= -O
 
-.PHONY: all build install uninstall doctor clean reload
+.PHONY: all build install uninstall doctor clean reload test
 
 all: build
 
@@ -45,6 +45,9 @@ reload:
 	@launchctl bootout "gui/$$(id -u)/$(PLIST_LABEL)" 2>/dev/null || true
 	@launchctl bootstrap "gui/$$(id -u)" "$(PLIST_FILE)"
 	@echo "✓ cmux-ffm reloaded."
+
+test: build
+	@./tests/run.sh ./cmux-ffm
 
 doctor: build
 	@./cmux-ffm --doctor

@@ -17,3 +17,5 @@ jobs:
         run: ./cmux-ffm --help
       - name: Verify Version
         run: ./cmux-ffm --version
+      - name: Regression tests (fake cmux)
+        run: ./tests/run.sh ./cmux-ffm

@@ -1,0 +1,4 @@
+#!/usr/bin/env bash
+# Writes ~200 KB to stderr before answering: more than a pipe buffer holds.
+head -c 200000 /dev/zero | tr '\0' 'x' >&2
+exec "$(dirname "$0")/ok" "$@"

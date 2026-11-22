@@ -9,13 +9,33 @@ A lightweight, zero-latency **focus-follows-mouse (hover autofocus)** daemon for
 
 Hover your cursor over any terminal pane to focus it immediately—no clicking required.
 
+> [!TIP]
+> **Try the built-in option first.** Since **cmux 0.62.0**, cmux honors Ghostty's own
+> `focus-follows-mouse` setting ([manaflow-ai/cmux#519](https://github.com/manaflow-ai/cmux/pull/519)).
+> Add this line to `~/.config/ghostty/config` and restart cmux:
+>
+> ```
+> focus-follows-mouse = true
+> ```
+>
+> That needs no daemon and no automation socket. Use `cmux-ffm` only if you want what the
+> built-in option doesn't do (see below), or if you run a cmux older than 0.62.0.
+
 ---
 
 ## Why this exists
 
-cmux does not provide a native focus-follows-mouse configuration option (`app.focusPaneOnFirstClick` only affects clicks, not hover). 
+Older cmux versions ignored Ghostty's `focus-follows-mouse`, and cmux's own `app.focusPaneOnFirstClick` only affects clicks, not hover. `cmux-ffm` was written to fill that gap.
 
-`cmux-ffm` runs as a lightweight background daemon that bridges this gap. It hit-tests cursor movement against live cmux pane geometry via the local cmux automation socket, switching pane focus seamlessly.
+What it still does differently from the built-in option:
+
+| | built-in `focus-follows-mouse` | `cmux-ffm` |
+|---|---|---|
+| Focus switch | the moment the pointer enters a terminal | after the pointer rests 50 ms (tunable with `--dwell`), so sweeping across panes doesn't move focus |
+| Panes it can focus | terminal surfaces | every pane `cmux list-panes` reports, via `cmux focus-pane` |
+| Setup | one config line | a LaunchAgent + cmux socket in `automation` mode |
+
+`cmux-ffm` runs as a lightweight background daemon. It hit-tests cursor movement against live cmux pane geometry via the local cmux automation socket and switches pane focus with `cmux focus-pane`.
 
 ## Key Features
 
@@ -25,7 +45,8 @@ cmux does not provide a native focus-follows-mouse configuration option (`app.fo
   - **50ms dwell**: Prevents accidental focus theft while moving across panes.
   - **Sticky focus**: A parked pointer never steals focus back. Manual clicks or keyboard shortcuts (like `⌥⌘-Arrow` or `Cmd+[`/`Cmd+]`) stay focused until you deliberately move the mouse into another pane.
 - 🔒 **Zero TCC Accessibility permissions**: Hit-tests using public CoreGraphics window bounds (`CGWindowListCopyWindowInfo`) and cmux socket APIs. No Accessibility (`AXUIElement`) or screen recording permissions needed.
-- 🔋 **Battery-efficient**: Polls only when cmux is frontmost, halts evaluation when the mouse is stationary, and ignores cursor movement while mouse buttons are held down (preventing interference with text selection or divider drags).
+- 🔋 **Battery-efficient**: Sleeps until cmux becomes the active app (no polling at all while you're elsewhere), halts evaluation when the mouse is stationary, and ignores cursor movement while mouse buttons are held down (preventing interference with text selection or divider drags).
+- 🧯 **Can't hang**: every cmux call has a 3 s timeout, so a stuck cmux CLI can't freeze the daemon.
 - 🩺 **Built-in diagnostics**: Run `cmux-ffm --doctor` to verify socket connectivity, binary resolution, and daemon state in seconds.
 
 ---
@@ -71,7 +92,7 @@ cmux-ffm --doctor
 Expected output:
 ```text
 === cmux-focus-follows-mouse doctor ===
-Version: 1.0.0
+Version: 1.1.0
 
 [✓] cmux CLI binary found: /Applications/cmux.app/Contents/Resources/bin/cmux
 [✓] cmux is running (PID: 43466)
@@ -81,6 +102,14 @@ Version: 1.0.0
 [✓] LaunchAgent is loaded and running in launchd.
 
 Doctor check completed.
+```
+
+If cmux is not running, the doctor says so and skips the socket test instead of blaming your config.
+
+To print the pane rectangles cmux reports (what the daemon hit-tests against):
+
+```bash
+cmux-ffm --layout
 ```
 
 To watch live focus events in real time:
@@ -117,7 +146,7 @@ cmux-ffm --debug
                         └─────────────────────────────────┘
 ```
 
-1. **Pointer Monitoring**: Monitors global cursor position every 50ms using `NSEvent.mouseLocation`. Stops evaluating after 1 second of inactivity to eliminate idle CPU cycles.
+1. **Pointer Monitoring**: While cmux is the active app, monitors global cursor position every 50ms using `NSEvent.mouseLocation`. Stops evaluating after 1 second of inactivity, and stops the timer entirely when another app becomes active.
 2. **Window Association**: Resolves the frontmost cmux window on layer 0 containing the pointer.
 3. **Geometry Hit-Testing**: Evaluates pointer location against `cmux list-panes --json`. The pane `pixel_frame` coordinates reported by cmux are window-relative and dynamically include the left sidebar's current width.
 4. **Dwell Confirmation**: Once the pointer enters a candidate pane, a 50ms dwell timer ensures the cursor is resting rather than traveling through. It re-verifies against fresh geometry before issuing `cmux focus-pane`.
@@ -134,6 +163,7 @@ Flags:
   -v, --version         Show version
   --doctor              Diagnose connection, socket configuration, and launchd status
   --debug               Run in foreground with verbose event logging
+  --layout              Print the pane rectangles cmux reports, then exit
   --dwell <seconds>     Time pointer must rest in pane before focusing (default: 0.05)
   --poll <seconds>      Polling interval in seconds (default: 0.05)
 ```
@@ -154,6 +184,16 @@ Flags:
   ```bash
   make uninstall
   ```
+
+---
+
+## Tests
+
+```bash
+make test
+```
+
+Runs the daemon against fake `cmux` CLIs (in `tests/fake-cmux/`): pane parsing, a cmux call that floods stderr, and one that never returns. No cmux install needed; CI runs the same.
 
 ---
 
